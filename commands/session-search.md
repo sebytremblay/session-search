@@ -12,6 +12,12 @@ The user invoked this command with query: $ARGUMENTS
 
 Execute these three steps in sequence.
 
+Before starting, generate a unique run identifier:
+```bash
+RUN_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex[:8])")
+```
+Use this identifier in all temporary file paths below.
+
 ### Step 1: Session Mapping
 
 1. Read `~/.claude/session-search/index.jsonl`. If the file does not exist or contains zero lines, inform the user that no sessions have been summarized yet and suggest running retroactive summarization. Stop.
@@ -22,7 +28,8 @@ Execute these three steps in sequence.
 4. Produce a list of matching session IDs and resolve each to its file path: `~/.claude/projects/<projectId>/<sessionId>.jsonl`.
 5. If the query requires richer context for session selection, read the corresponding entries from `~/.claude/session-search/takeaways.jsonl` (keyed by `sessionId`) to access the 3-5 sentence takeaways for each session.
 6. If zero sessions match, inform the user and suggest broadening the query. Stop.
-7. Write the matched file paths as a JSON array to `/tmp/session-search-manifest.json`.
+7. If any session files exist in `~/.claude/projects/` that lack entries in `index.jsonl`, print: "Found N sessions without summaries. Run `summarize-session --backfill` to generate missing summaries." Continue with the sessions that already have summaries.
+8. Write the matched file paths as a JSON array to `/tmp/session-search-manifest-${RUN_ID}.json`.
 
 ### Step 2: Data Extraction
 
@@ -42,15 +49,17 @@ Execute these three steps in sequence.
    > [Insert the task description from above]
    >
    > ## Session Files
-   > Read the manifest at `/tmp/session-search-manifest.json` for the list of session file paths.
+   > Read the manifest at `/tmp/session-search-manifest-${RUN_ID}.json` for the list of session file paths.
    >
    > ## Requirements
-   > 1. Write a Python 3 script to `/tmp/session-search-extract.py`
+   > 1. Write a Python 3 script to `/tmp/session-search-extract-${RUN_ID}.py`
    > 2. Use only standard library modules (json, os, sys, re, datetime, collections, pathlib)
    > 3. Read JSONL files line by line. Skip malformed lines with try/except around json.loads()
-   > 4. Write output as JSON to `/tmp/session-search-output.json`
-   > 5. Execute: `python3 /tmp/session-search-extract.py`
+   > 4. Write output as JSON to `/tmp/session-search-output-${RUN_ID}.json`
+   > 5. Execute: `python3 /tmp/session-search-extract-${RUN_ID}.py`
    > 6. Verify the output file contains valid JSON
+   > 7. If the script fails to execute or produces invalid JSON, read the stderr output, diagnose the error, fix the script, and re-execute. Allow up to 2 retries before reporting failure.
+   > 8. The output JSON must stay under 50,000 characters. Aggregate data within the script: compute counts, top-N lists, averages, and statistical summaries rather than emitting raw per-entry arrays. The analysis subagent receives this output in its context window, so token efficiency is a hard constraint.
 
 4. Wait for the subagent to complete.
 
@@ -63,7 +72,7 @@ Execute these three steps in sequence.
    - Writing style constraints: no contractions, active voice, present tense, no em dashes
 2. Spawn an analysis subagent using the Agent tool with the custom system prompt:
 
-   > Read the extracted session data from `/tmp/session-search-output.json` and answer the following query:
+   > Read the extracted session data from `/tmp/session-search-output-${RUN_ID}.json` and answer the following query:
    >
    > **User query**: $ARGUMENTS
    >
@@ -77,5 +86,5 @@ Execute these three steps in sequence.
 
 Remove temporary files:
 ```
-rm -f /tmp/session-search-manifest.json /tmp/session-search-extract.py /tmp/session-search-output.json
+rm -f /tmp/session-search-manifest-${RUN_ID}.json /tmp/session-search-extract-${RUN_ID}.py /tmp/session-search-output-${RUN_ID}.json
 ```

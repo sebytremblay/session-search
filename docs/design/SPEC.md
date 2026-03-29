@@ -246,8 +246,8 @@ Output ONLY the JSON object. No markdown fencing, no extra text.
 When the search command encounters session IDs lacking summaries, the orchestrator:
 
 1. Prints: "Found N sessions without summaries."
-2. Asks the user: "Generate summaries for unsummarized sessions? This invokes claude -p for each session."
-3. On confirmation, iterates through unsummarized session files and invokes the same summarization flow for each.
+2. Prints: "Run `summarize-session --backfill` to generate missing summaries."
+3. Continues the search using only sessions that already have summaries in the index.
 
 ## 5. Component 2: Session Search
 
@@ -309,7 +309,7 @@ After collecting session IDs, the orchestrator cross-references against known se
 
 1. Use `Glob` to find all `*.jsonl` files matching session UUID patterns.
 2. Compare against session IDs present in `index.jsonl`.
-3. If unsummarized sessions exist, inform the user and offer retroactive summarization (per Section 4.6).
+3. If unsummarized sessions exist, print a warning with the count of unsummarized sessions and a copy-pasteable backfill command (per Section 4.6).
 
 ## 7. Step 2: Data Extraction
 
@@ -342,7 +342,9 @@ You write and execute Python 3 scripts that extract data from Claude Code sessio
 6. Write output as JSON to /tmp/session-search-<uuid>.json
 7. Execute the script: python3 /tmp/session-search-<uuid>.py
 8. Verify the output file contains valid JSON
-9. Report the output file path
+9. If the script fails to execute or produces invalid JSON, read the stderr output, diagnose the error, fix the script, and re-execute. Allow up to 2 retries before reporting failure.
+10. The output JSON must stay under 50,000 characters. Aggregate data within the script: compute counts, top-N lists, averages, and statistical summaries rather than emitting raw per-entry arrays. The analysis subagent receives this output in its context window, so token efficiency is a hard constraint.
+11. Report the output file path
 ```
 
 ### 7.3 Rationale for Code Generation
@@ -1064,6 +1066,12 @@ The user invoked this command with query: $ARGUMENTS
 
 Execute these three steps in sequence.
 
+Before starting, generate a unique run identifier:
+```bash
+RUN_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex[:8])")
+```
+Use this identifier in all temporary file paths below.
+
 ### Step 1: Session Mapping
 
 1. Read `~/.claude/session-search/index.jsonl`. If the file does not exist or contains zero lines, inform the user that no sessions have been summarized yet and suggest running retroactive summarization. Stop.
@@ -1074,7 +1082,8 @@ Execute these three steps in sequence.
 4. Produce a list of matching session IDs and resolve each to its file path: `~/.claude/projects/<projectId>/<sessionId>.jsonl`.
 5. If the query requires richer context for session selection, read the corresponding entries from `~/.claude/session-search/takeaways.jsonl` (keyed by `sessionId`) to access the 3-5 sentence takeaways for each session.
 6. If zero sessions match, inform the user and suggest broadening the query. Stop.
-7. Write the matched file paths as a JSON array to `/tmp/session-search-manifest.json`.
+7. If any session files exist in `~/.claude/projects/` that lack entries in `index.jsonl`, print: "Found N sessions without summaries. Run `summarize-session --backfill` to generate missing summaries." Continue with the sessions that already have summaries.
+8. Write the matched file paths as a JSON array to `/tmp/session-search-manifest-${RUN_ID}.json`.
 
 ### Step 2: Data Extraction
 
@@ -1094,15 +1103,17 @@ Execute these three steps in sequence.
    > [Insert the task description from above]
    >
    > ## Session Files
-   > Read the manifest at `/tmp/session-search-manifest.json` for the list of session file paths.
+   > Read the manifest at `/tmp/session-search-manifest-${RUN_ID}.json` for the list of session file paths.
    >
    > ## Requirements
-   > 1. Write a Python 3 script to `/tmp/session-search-extract.py`
+   > 1. Write a Python 3 script to `/tmp/session-search-extract-${RUN_ID}.py`
    > 2. Use only standard library modules (json, os, sys, re, datetime, collections, pathlib)
    > 3. Read JSONL files line by line. Skip malformed lines with try/except around json.loads()
-   > 4. Write output as JSON to `/tmp/session-search-output.json`
-   > 5. Execute: `python3 /tmp/session-search-extract.py`
+   > 4. Write output as JSON to `/tmp/session-search-output-${RUN_ID}.json`
+   > 5. Execute: `python3 /tmp/session-search-extract-${RUN_ID}.py`
    > 6. Verify the output file contains valid JSON
+   > 7. If the script fails to execute or produces invalid JSON, read the stderr output, diagnose the error, fix the script, and re-execute. Allow up to 2 retries before reporting failure.
+   > 8. The output JSON must stay under 50,000 characters. Aggregate data within the script: compute counts, top-N lists, averages, and statistical summaries rather than emitting raw per-entry arrays. The analysis subagent receives this output in its context window, so token efficiency is a hard constraint.
 
 4. Wait for the subagent to complete.
 
@@ -1115,7 +1126,7 @@ Execute these three steps in sequence.
    - Writing style constraints: no contractions, active voice, present tense, no em dashes
 2. Spawn an analysis subagent using the Agent tool with the custom system prompt:
 
-   > Read the extracted session data from `/tmp/session-search-output.json` and answer the following query:
+   > Read the extracted session data from `/tmp/session-search-output-${RUN_ID}.json` and answer the following query:
    >
    > **User query**: $ARGUMENTS
    >
@@ -1129,13 +1140,13 @@ Execute these three steps in sequence.
 
 Remove temporary files:
 ```
-rm -f /tmp/session-search-manifest.json /tmp/session-search-extract.py /tmp/session-search-output.json
+rm -f /tmp/session-search-manifest-${RUN_ID}.json /tmp/session-search-extract-${RUN_ID}.py /tmp/session-search-output-${RUN_ID}.json
 ```
 ````
 
 ## 12. Summarization Script: `scripts/summarize-session.sh`
 
-The summarization script runs as the hook handler invoked on `SessionEnd`. The hook passes session metadata through environment variables. The script expects `SESSION_ID` to contain the session identifier.
+The summarization script runs as the hook handler invoked on `SessionEnd`. The hook passes session metadata through environment variables. The script expects `SESSION_ID` to contain the session identifier. The script verifies `jq` availability at startup and exits with a diagnostic message if the binary is not found.
 
 ```bash
 #!/usr/bin/env bash
@@ -1245,6 +1256,10 @@ Multiple `SessionEnd` events may fire within a short window when a user closes s
 ### 13.9 Missing Summary Store Directory
 
 The summarization script calls `mkdir -p ~/.claude/session-search/` before any file operations. The `-p` flag creates the directory if absent and succeeds silently if the directory already exists, eliminating the need for a separate existence check.
+
+### 13.10 Extraction Script Failure
+
+If the extraction script fails to execute or produces invalid output, the extraction subagent reads the stderr, corrects the script, and re-executes. The subagent allows up to two retries. After three total attempts, the subagent reports failure and the orchestrator informs the user that extraction could not complete for the given query.
 
 ## 14. Out of Scope for v0
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+command -v jq >/dev/null 2>&1 || { echo "ERROR: jq is required but not installed" >&2; exit 1; }
 
 # scripts/summarize-session.sh
 # Summarizes a completed Claude Code session and appends to the summary store.
