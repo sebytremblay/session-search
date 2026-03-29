@@ -1,0 +1,9 @@
+{
+  "name": "session-search",
+  "description": "Semantically search Claude Code session logs to extract custom insights including ROI analysis, work summaries, and skill extraction",
+  "version": "0.1.0",
+  "author": {
+    "name": "Sebastian Tremblay"
+  },
+  "license": "MIT"
+}
