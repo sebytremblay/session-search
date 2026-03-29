@@ -1,0 +1,30 @@
+{
+  "name": "session-search",
+  "owner": {
+    "name": "Sebastian Tremblay and Alexander Zwerner",
+    "url": "https://github.com/sebytremblay/session-search"
+  },
+  "plugins": [
+    {
+      "name": "session-search",
+      "source": "./",
+      "description": "Semantically search Claude Code session logs to extract custom insights including ROI analysis, work summaries, and skill extraction",
+      "version": "0.1.0",
+      "author": {
+        "name": "Sebastian Tremblay and Alexander Zwerner",
+        "url": "https://github.com/sebytremblay/session-search"
+      },
+      "license": "MIT",
+      "repository": "https://github.com/sebytremblay/session-search",
+      "homepage": "https://github.com/sebytremblay/session-search",
+      "keywords": [
+        "Claude Code",
+        "plugin",
+        "search",
+        "session",
+        "log",
+        "analysis"
+      ]
+    }
+  ]
+}
