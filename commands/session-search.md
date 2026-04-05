@@ -12,11 +12,49 @@ The user invoked this command with query: $ARGUMENTS
 
 Execute these steps in sequence.
 
-Before starting, generate a unique run identifier:
+### Pre-flight
+
+Run the following checks before any other step:
+
 ```bash
-RUN_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex[:8])")
+python3 --version && RUN_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex[:8])")
 ```
-Use this identifier in all temporary file paths below.
+
+If `python3 --version` fails, print:
+
+> Python 3 is required. Install it via Homebrew (macOS: `brew install python3`) or apt (Debian/Ubuntu: `apt install python3`).
+
+Stop.
+
+Use RUN_ID in all temporary file paths below.
+
+### Analysis Templates
+
+The following templates define the analysis subagent prompt for each query category. Step 3 selects the matching template and substitutes the user query and data source path.
+
+**TEMPLATE_SUBSET_SUMMARY** — for time/project-bounded summarization queries ("today", "this week", specific project):
+
+> You produce work summaries for software teams. Read the session data at [DATA_SOURCE]. For each session, collapse the user prompts and tool activity into one or two concrete work items written in imperative mood (for example: "Add rate limiting middleware to /api/v2 endpoints"). Classify each work item as one of: feature, bugfix, refactor, or research. Produce a 1-3 sentence executive summary describing the period at a high level, followed by categorized bullet lists. Infer specifics from file paths, command text, and user prompts. Do not include session IDs or timestamps in the output. Writing rules: no contractions, active voice, present tense, no em dashes, no weak openers.
+>
+> **User query:** [USER_QUERY]
+
+**TEMPLATE_ALL_ANALYTICAL** — for ROI, satisfaction, friction, and helpfulness analyses:
+
+> You analyze developer productivity data. Read the session data at [DATA_SOURCE]. Compute aggregate metrics across all sessions. For ROI queries: apply these multiplier heuristics: sessions under 5 minutes with fewer than 5 tool calls map to simple lookups (3x manual equivalent); sessions between 5 and 30 minutes with 5 to 30 tool calls map to moderate tasks (4x); sessions over 30 minutes or with more than 30 tool calls map to complex work (5x). Reduce the multiplier by 0.5 for each correction beyond two. For satisfaction or friction queries: compute distributions across the structured facet fields and identify the top drivers. Produce an executive summary (2-3 sentences), a key metrics block, and a breakdown table. Writing rules: no contractions, active voice, present tense, no em dashes.
+>
+> **User query:** [USER_QUERY]
+
+**TEMPLATE_ALL_PATTERN** — for skill extraction and repeated behavior detection:
+
+> You identify reusable workflow patterns in developer session data. Read the session data at [DATA_SOURCE]. Identify behaviors that appear in three or more sessions and involve multi-step tool workflows. For each candidate pattern, examine tool sequences and prompt text together to infer user intent and the repeatable procedure. For each skill candidate, produce: a suggested skill name (kebab-case), the frequency (number of sessions), a trigger condition describing when the skill applies, numbered workflow steps, and a draft SKILL.md outline. Rank candidates by frequency descending. Output a header line with the total candidate count, then each numbered candidate. Writing rules: no contractions, active voice, present tense, no em dashes, no weak openers.
+>
+> **User query:** [USER_QUERY]
+
+**TEMPLATE_GENERIC_FALLBACK** — for unclassified queries:
+
+> You analyze Claude Code session data. Read the session data at [DATA_SOURCE] and answer the user's query as completely as the available data allows. Structure the output with a brief executive summary followed by supporting detail. Writing rules: no contractions, active voice, present tense, no em dashes.
+>
+> **User query:** [USER_QUERY]
 
 ### Pre-Step: Cold Start Detection
 
@@ -48,22 +86,20 @@ Use this identifier in all temporary file paths below.
 3. Classify the query:
    - **All sessions**: queries about aggregate statistics, broad patterns, ROI, friction analysis, satisfaction trends, or skill extraction select every session.
    - **Subset**: queries about a specific time range ("today", "this week"), project, or topic select only sessions whose `brief_summary`, `underlying_goal`, `goal_categories`, `session_type`, `projectId`, or `timestamp` fields match the query intent.
-4. If zero sessions match, inform the user and suggest broadening the query. Stop.
+4. If zero sessions match, inform the user that no sessions matched the query. Note that older sessions may lack facets; suggest running `/insights` to backfill and broadening the search terms. Stop.
 5. Determine whether the query can be answered from facet fields alone (**facet sufficiency**):
    - **Facet-sufficient queries**: outcome distributions, helpfulness ratings, session type breakdowns, friction analysis, goal category distributions, satisfaction trends, brief summary listings, underlying goal analysis. These queries do not require raw session log parsing.
    - **Facet-insufficient queries**: queries requiring tool call details, specific file paths, git operations, code changes, token usage, session duration, user prompt text beyond the brief summary, or tool call sequences.
 6. Write the matched facets as a JSON array to `/tmp/session-search-facets-${RUN_ID}.json`.
-7. If the query is facet-insufficient, resolve each matched `sessionId` to its raw session log path: `~/.claude/projects/<projectId>/<sessionId>.jsonl`. Verify each file exists. Write the valid file paths as a JSON array to `/tmp/session-search-manifest-${RUN_ID}.json`.
-8. Check for unsummarized sessions: use Glob to find all non-agent `*.jsonl` files in `~/.claude/projects/*/`, compare against sessionIds present in the facet files. If unsummarized sessions exist, print: "Found N sessions without facets. The SessionEnd hook generates facets automatically for new sessions. Run `/insights` to backfill older sessions." Continue with the sessions that have facets.
+7. If the query is facet-insufficient, resolve each matched `sessionId` to its raw session log path: `~/.claude/projects/<projectId>/<sessionId>.jsonl`. Verify each file exists. Keep the valid paths in memory for Step 2.
 
 ### Step 2: Data Extraction
 
 1. If the query is **facet-sufficient** (determined in Step 1): skip this step entirely. The facet data at `/tmp/session-search-facets-${RUN_ID}.json` contains all the information needed. Proceed directly to Step 3.
 
 2. If the query is **facet-insufficient**:
-   a. Verify Python 3 availability by running `python3 --version`. If the command fails, print installation instructions and stop.
-   b. Determine what data the analysis step needs based on the user's query. Write a clear task description specifying exactly which fields to extract from the session logs. Note which data points are already available in the facets (to avoid re-deriving them).
-   c. Spawn a subagent using the Agent tool with model `haiku` and the following prompt structure:
+   a. Determine what data the analysis step needs based on the user's query. Write a clear task description specifying exactly which fields to extract from the session logs. Note which data points are already available in the facets (to avoid re-deriving them).
+   b. Spawn a subagent using the Agent tool with model `haiku` and the following prompt structure:
 
    > You write and execute Python 3 scripts that extract data from Claude Code session logs.
    >
@@ -80,7 +116,17 @@ Use this identifier in all temporary file paths below.
    > [Insert the task description from above]
    >
    > ## Session Files
-   > Read the manifest at `/tmp/session-search-manifest-${RUN_ID}.json` for the list of session file paths.
+   > Process the following session file paths (the orchestrator inserts the resolved paths from Step 1 as a Python list literal):
+   >
+   > ```python
+   > SESSION_PATHS = [
+   >     "/path/to/session1.jsonl",
+   >     "/path/to/session2.jsonl"
+   > ]
+   > OUTPUT_PATH = "/tmp/session-search-output-${RUN_ID}.json"
+   > ```
+   >
+   > Define these as top-level constants at the start of the extraction script. Do not read paths from a file argument.
    >
    > ## Requirements
    > 1. Write a Python 3 script to `/tmp/session-search-extract-${RUN_ID}.py`
@@ -93,33 +139,27 @@ Use this identifier in all temporary file paths below.
    > 8. If the script fails to execute or produces invalid JSON, read the stderr output, diagnose the error, fix the script, and re-execute. Allow up to 2 retries before reporting failure.
    > 9. The output JSON must stay under 50,000 characters. Aggregate data within the script: compute counts, top-N lists, averages, and statistical summaries rather than emitting raw per-entry arrays. The analysis subagent receives this output in its context window, so token efficiency is a hard constraint.
 
-   d. Wait for the subagent to complete.
+   c. Wait for the subagent to complete.
 
 ### Step 3: Analysis
 
-1. Build a system prompt tailored to the user's query. The prompt must include:
-   - The user's original query (verbatim)
-   - Whether the data source is facet-only or facet-plus-extraction (this determines which file the subagent reads)
-   - Analysis methodology specific to the query type
-   - Output format expectations
-   - Writing style constraints: no contractions, active voice, present tense, no em dashes
-2. Spawn an analysis subagent using the Agent tool with the custom system prompt:
+1. Select the analysis template that matches the query classification from Step 1:
+   - Subset queries: use TEMPLATE_SUBSET_SUMMARY
+   - All-sessions queries requiring computed metrics, ratings, or distributions: use TEMPLATE_ALL_ANALYTICAL
+   - All-sessions queries requiring behavioral patterns or skill detection: use TEMPLATE_ALL_PATTERN
+   - Queries that match none of the above: use TEMPLATE_GENERIC_FALLBACK
 
-   > Read the session data and answer the following query:
-   >
-   > **User query**: $ARGUMENTS
-   >
-   > **Data source**: [If facet-only: "Read the facet data from `/tmp/session-search-facets-${RUN_ID}.json`. Each entry contains structured session metadata including goals, outcomes, satisfaction, friction, and summaries." | If facet-plus-extraction: "Read the extracted session data from `/tmp/session-search-output-${RUN_ID}.json`, which combines pre-extracted facet metadata with raw session log data."]
-   >
-   > [Insert tailored analysis instructions]
-   >
-   > Print the complete analysis directly to the terminal using markdown formatting.
+2. Substitute into the selected template:
+   - Replace `[USER_QUERY]` with the user's original query verbatim ($ARGUMENTS)
+   - Replace `[DATA_SOURCE]` with the appropriate file path:
+     - If facet-sufficient: `/tmp/session-search-facets-${RUN_ID}.json`
+     - If facet-insufficient: `/tmp/session-search-output-${RUN_ID}.json`
 
-3. Wait for the subagent to complete.
+3. Spawn an analysis subagent using the Agent tool with model `haiku` and the completed template as the prompt. Wait for the subagent to complete.
 
 ### Cleanup
 
 Remove temporary files:
 ```
-rm -f /tmp/session-search-manifest-${RUN_ID}.json /tmp/session-search-extract-${RUN_ID}.py /tmp/session-search-output-${RUN_ID}.json /tmp/session-search-facets-${RUN_ID}.json /tmp/session-search-import-${RUN_ID}.py
+rm -f /tmp/session-search-extract-${RUN_ID}.py /tmp/session-search-output-${RUN_ID}.json /tmp/session-search-facets-${RUN_ID}.json /tmp/session-search-import-${RUN_ID}.py
 ```

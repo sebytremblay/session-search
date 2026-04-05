@@ -272,11 +272,14 @@ The plugin uses camelCase field names (aligned with Claude Code session log conv
 
 ### 4.6 Unsummarized Session Guidance
 
-When the search command encounters sessions lacking facets, the orchestrator:
+When the search command finds zero sessions matching the query, the orchestrator:
 
-1. Counts the unsummarized sessions.
-2. Prints: "Found N sessions without facets. The SessionEnd hook generates facets automatically for new sessions. Run `/insights` to backfill older sessions."
-3. Continues the search using only sessions that have facets.
+1. Informs the user that no sessions matched the query criteria.
+2. Notes that older sessions may lack facets and suggests running `/insights` to backfill.
+3. Suggests broadening the search terms.
+4. Stops.
+
+The orchestrator does not scan for unsummarized sessions during successful queries. Sessions without facets are already excluded from query results by their absence from the facet partition files.
 
 ### 4.7 Error Observability
 
@@ -326,6 +329,11 @@ The search command detects a cold-start condition when `~/.claude/session-search
 User query ($ARGUMENTS)
   |
   v
+Pre-flight
+  Verify Python 3 availability. Generate RUN_ID.
+  Fail fast if Python 3 is missing.
+  |
+  v
 Pre-Step: Cold Start Detection
   Check facets directory. Import or generate if needed.
   |
@@ -342,7 +350,7 @@ Step 2: Data Extraction
   |
   v
 Step 3: Analysis
-  Spawn analysis subagent with custom system prompt.
+  Select analysis template. Spawn Haiku analysis subagent.
   Read facet or extracted data, produce final output.
   Print to terminal.
 ```
@@ -378,14 +386,6 @@ After selecting facets, the orchestrator determines whether the query can be ans
 
 If the query is facet-insufficient, the orchestrator resolves each matched `sessionId` to its raw session log path: `~/.claude/projects/<projectId>/<sessionId>.jsonl`.
 
-### 6.5 Missing Facets
-
-After collecting facets, the orchestrator cross-references against known session files in `~/.claude/projects/*/`:
-
-1. Use `Glob` to find all non-agent `*.jsonl` files matching session UUID patterns.
-2. Compare against session IDs present in the facet partition files.
-3. If unsummarized sessions exist, print a warning with the count and guidance to run `/insights` for backfill (per Section 4.6).
-
 ## 7. Step 2: Data Extraction
 
 ### 7.1 Subagent Configuration
@@ -409,16 +409,26 @@ Structured facet data has already been extracted for each session and is availab
 [Dynamically generated description of what data to extract, tailored to the user's query]
 
 ## Session Files
-[List of absolute file paths to relevant session JSONL files]
+The session file paths to process (provided as a Python list literal in the script):
+
+```python
+SESSION_PATHS = [
+    "/path/to/session1.jsonl",
+    "/path/to/session2.jsonl"
+]
+OUTPUT_PATH = "/tmp/session-search-<uuid>.json"
+```
+
+Define these as top-level constants at the start of the extraction script. Do not read paths from a file argument.
 
 ## Requirements
 1. Write a Python 3 script to /tmp/session-search-<uuid>.py
-2. Use only standard library modules (json, os, sys, re, datetime, collections, pathlib)
+2. Use only standard library modules (json, os, re, datetime, collections, pathlib)
 3. The script reads the listed JSONL files line by line using json.loads()
 4. Read and merge pre-extracted facet data from /tmp/session-search-facets-<uuid>.json
 5. Skip malformed lines with a try/except around json.loads()
 6. Extract the data described in the Task section
-7. Write output as JSON to /tmp/session-search-<uuid>.json
+7. Write output as JSON to OUTPUT_PATH
 8. Execute the script: python3 /tmp/session-search-<uuid>.py
 9. Verify the output file contains valid JSON
 10. If the script fails to execute or produces invalid JSON, read the stderr output, diagnose the error, fix the script, and re-execute. Allow up to 2 retries before reporting failure.
@@ -440,7 +450,7 @@ A generated script adapts to each query without maintaining a library of hardcod
 
 - **Language:** Python 3
 - **Dependencies:** standard library only (no pip installs)
-- **Input:** reads JSONL files line by line (never loads full file into memory)
+- **Input:** session paths provided as a `SESSION_PATHS` list literal at the top of the script (never reads from `sys.argv` or a manifest file)
 - **Output:** writes a single JSON file to `/tmp/`
 - **Error handling:** skip malformed lines, log skipped count to stderr
 - **Lifecycle:** the orchestrator deletes both the script and output file after Step 3 completes
@@ -453,19 +463,19 @@ When the orchestrator determines the query is facet-sufficient (per Section 6.4)
 
 ### 8.1 Subagent Configuration
 
-- **Model:** default session model (inherits from the user's Claude Code configuration)
+- **Model:** `haiku` (optimized for speed on structured formatting and summarization tasks)
 - **Tools:** `Read, Bash`
 
-### 8.2 System Prompt Construction
+### 8.2 Analysis Template Selection
 
-The orchestrator builds a task-specific system prompt for the analysis subagent. Each prompt includes:
+The orchestrator selects an analysis template based on the query classification from Step 1. Four templates cover all query categories:
 
-1. The user's original query (verbatim)
-2. The analysis methodology (tailored to the query type)
-3. Output format expectations
-4. Writing style constraints: no contractions, active voice, no em dashes, present habitual tense
+- **TEMPLATE_SUBSET_SUMMARY**: Time/project-bounded summarization queries. Produces work items per session classified as feature, bugfix, refactor, or research, followed by an executive summary and categorized bullet lists.
+- **TEMPLATE_ALL_ANALYTICAL**: ROI, satisfaction, friction, and helpfulness analyses. Computes aggregate metrics, applies productivity multiplier heuristics, and produces a key metrics block with a category breakdown table.
+- **TEMPLATE_ALL_PATTERN**: Skill extraction and repeated behavior detection. Identifies patterns appearing in three or more sessions, ranks by frequency, and produces numbered skill candidates with trigger conditions and workflow steps.
+- **TEMPLATE_GENERIC_FALLBACK**: Unclassified queries. Produces a structured response from the available data.
 
-The orchestrator does not use a generic analysis prompt. Each invocation receives a custom prompt that reflects the specific task, the data schema of the extracted JSON, and the desired output structure.
+Each template embeds the writing style constraints from `docs/guides/WRITING_STYLE.md`: no contractions, active voice, present tense, no em dashes. The orchestrator substitutes the user query verbatim and the data source file path. No prompt construction reasoning occurs at runtime.
 
 ### 8.3 Output
 
@@ -487,17 +497,7 @@ Each example walks through the complete three-step flow with concrete artifacts:
 
 The orchestrator classifies the query as "all sessions" because ROI calculation demands comprehensive coverage across every recorded interaction. The orchestrator reads all `.jsonl` files from `~/.claude/session-search/facets/`, parses each line, and collects all facets regardless of project or date. The facet partitions yield 47 sessions spanning 8 distinct projects. The orchestrator determines this query is facet-insufficient because ROI analysis requires token counts and session durations from raw session logs.
 
-The orchestrator builds a JSON manifest of session file paths:
-
-```json
-[
-  "/Users/jane/.claude/projects/-Users-jane-myproject/abc123.jsonl",
-  "/Users/jane/.claude/projects/-Users-jane-myproject/def456.jsonl",
-  "/Users/jane/.claude/projects/-Users-jane-api-server/aaa111.jsonl"
-]
-```
-
-The orchestrator writes the manifest to a temporary file and prepares the extraction step.
+The orchestrator resolves the session file paths for the extraction step.
 
 #### Step 2: Data Extraction
 
@@ -511,9 +511,14 @@ The orchestrator writes the manifest to a temporary file and prepares the extrac
 #!/usr/bin/env python3
 """Extract per-session metadata for ROI calculation."""
 import json
-import sys
 import re
 from datetime import datetime
+
+SESSION_PATHS = [
+    # orchestrator inserts resolved paths here
+]
+OUTPUT_PATH = "/tmp/session-search-output-<uuid>.json"
+
 
 CORRECTION_WORDS = re.compile(
     r'\b(no|wrong|undo|revert|actually|instead|fix that)\b', re.IGNORECASE
@@ -596,23 +601,20 @@ def parse_session(path):
     }
 
 def main():
-    with open(sys.argv[1], 'r') as f:
-        session_paths = json.load(f)
-
     results = []
-    for path in session_paths:
+    for path in SESSION_PATHS:
         record = parse_session(path)
         if record:
             results.append(record)
 
-    with open(sys.argv[2], 'w') as f:
+    with open(OUTPUT_PATH, 'w') as f:
         json.dump(results, f, indent=2)
 
 if __name__ == '__main__':
     main()
 ```
 
-The script writes its output to `/tmp/session-search-<uuid>.json`.
+The script writes its output to `OUTPUT_PATH`.
 
 #### Step 3: Analysis
 
@@ -689,7 +691,11 @@ The orchestrator classifies the query as "subset" because the word "today" const
 #!/usr/bin/env python3
 """Extract chronological work record for daily summary."""
 import json
-import sys
+
+SESSION_PATHS = [
+    # orchestrator inserts resolved paths here
+]
+OUTPUT_PATH = "/tmp/session-search-output-<uuid>.json"
 
 TOOL_KEY_FIELDS = {
     'Read': ['file_path'],
@@ -760,18 +766,15 @@ def extract_session(path):
     }
 
 def main():
-    with open(sys.argv[1], 'r') as f:
-        session_paths = json.load(f)
-
     results = []
-    for path in session_paths:
+    for path in SESSION_PATHS:
         record = extract_session(path)
         if record:
             results.append(record)
 
     results.sort(key=lambda r: r['start_time'])
 
-    with open(sys.argv[2], 'w') as f:
+    with open(OUTPUT_PATH, 'w') as f:
         json.dump(results, f, indent=2)
 
 if __name__ == '__main__':
@@ -839,9 +842,14 @@ The orchestrator classifies the query as "all sessions" because pattern detectio
 #!/usr/bin/env python3
 """Extract repeated behavioral patterns for skill candidate identification."""
 import json
-import sys
 import re
 from collections import defaultdict
+
+SESSION_PATHS = [
+    # orchestrator inserts resolved paths here
+]
+OUTPUT_PATH = "/tmp/session-search-output-<uuid>.json"
+
 
 PATH_PATTERN = re.compile(r'[/\\][\w./\\-]+\.\w+')
 QUOTED_PATTERN = re.compile(r'["\'].*?["\']')
@@ -897,14 +905,11 @@ def process_session(path):
     }
 
 def main():
-    with open(sys.argv[1], 'r') as f:
-        session_paths = json.load(f)
-
     sessions = []
     all_prompts = []
     seq_counter = defaultdict(lambda: {'count': 0, 'sessions': []})
 
-    for path in session_paths:
+    for path in SESSION_PATHS:
         record = process_session(path)
         if not record:
             continue
@@ -953,7 +958,7 @@ def main():
         ]
     }
 
-    with open(sys.argv[2], 'w') as f:
+    with open(OUTPUT_PATH, 'w') as f:
         json.dump(output, f, indent=2)
 
 if __name__ == '__main__':
@@ -1174,29 +1179,27 @@ Use this identifier in all temporary file paths below.
 4. If zero sessions match, inform the user and suggest broadening the query. Stop.
 5. Determine facet sufficiency: can the query be answered from facet fields alone?
 6. Write matched facets to `/tmp/session-search-facets-${RUN_ID}.json`.
-7. If facet-insufficient, resolve session file paths and write manifest to `/tmp/session-search-manifest-${RUN_ID}.json`.
-8. Check for unsummarized sessions and print guidance if any exist.
+7. If facet-insufficient, resolve session file paths and keep them in memory for Step 2. If zero sessions match, suggest running `/insights` to backfill and broadening the search terms.
 
 ### Step 2: Data Extraction
 
 1. If facet-sufficient: skip this step entirely. Proceed to Step 3.
 2. If facet-insufficient:
-   a. Verify Python 3 availability.
-   b. Spawn extraction subagent (model: haiku) with session log schema, pre-extracted facet data context, task description, and session manifest.
-   c. Subagent writes and executes a Python script that merges facet data with raw session log extraction.
-   d. Wait for subagent to complete.
+   a. Spawn extraction subagent (model: haiku) with session log schema, pre-extracted facet data context, task description, and session file paths embedded directly in the prompt.
+   b. Subagent writes and executes a Python script that merges facet data with raw session log extraction.
+   c. Wait for subagent to complete.
 
 ### Step 3: Analysis
 
-1. Build a system prompt noting whether the data source is facet-only or facet-plus-extraction.
-2. Spawn analysis subagent with custom system prompt.
+1. Select the analysis template matching the query classification (TEMPLATE_SUBSET_SUMMARY, TEMPLATE_ALL_ANALYTICAL, TEMPLATE_ALL_PATTERN, or TEMPLATE_GENERIC_FALLBACK).
+2. Spawn analysis subagent (model: haiku) with the completed template.
 3. Wait for subagent to complete.
 
 ### Cleanup
 
 Remove temporary files:
 ```
-rm -f /tmp/session-search-manifest-${RUN_ID}.json /tmp/session-search-extract-${RUN_ID}.py /tmp/session-search-output-${RUN_ID}.json /tmp/session-search-facets-${RUN_ID}.json /tmp/session-search-import-${RUN_ID}.py
+rm -f /tmp/session-search-extract-${RUN_ID}.py /tmp/session-search-output-${RUN_ID}.json /tmp/session-search-facets-${RUN_ID}.json /tmp/session-search-import-${RUN_ID}.py
 ```
 ````
 
@@ -1230,7 +1233,7 @@ The background worker checks the exit code of `claude -p`. A non-zero exit code 
 
 ### 13.5 Python Not Available
 
-Before the extraction subagent writes its script, the orchestrator runs `python3 --version` and inspects the exit code. A missing Python 3 installation causes the orchestrator to print platform-specific installation instructions (Homebrew for macOS, apt for Debian/Ubuntu) and halt execution.
+The pre-flight block runs `python3 --version` before any session mapping or cold-start import work begins. A missing Python 3 installation causes the orchestrator to print platform-specific installation instructions (Homebrew for macOS: `brew install python3`; apt for Debian/Ubuntu: `apt install python3`) and halt execution immediately. The user receives the error within seconds of invoking the command.
 
 ### 13.6 No Matching Sessions
 
@@ -1264,7 +1267,7 @@ The background worker logs all failures to `~/.claude/session-search/errors.log`
 
 ### 13.13 Facet-Session File Mismatch
 
-A facet may reference a session whose raw JSONL file no longer exists (the user deleted it or moved machines). When resolving session file paths for facet-insufficient queries, the orchestrator verifies file existence and excludes missing files from the manifest. The analysis proceeds with available data.
+A facet may reference a session whose raw JSONL file no longer exists (the user deleted it or moved machines). When resolving session file paths for facet-insufficient queries, the orchestrator verifies file existence and excludes missing files. The extraction subagent receives only the valid paths. The analysis proceeds with available data.
 
 ## 14. Out of Scope for v0
 
