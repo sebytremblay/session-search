@@ -27,11 +27,11 @@ session-search/
 
 | Path | Purpose |
 |------|---------|
-| `~/.claude/session-search/index.jsonl` | Lightweight session index (one line per session) |
-| `~/.claude/session-search/takeaways.jsonl` | Rich session takeaways (one line per session) |
+| `~/.claude/session-search/facets/<projectId>.jsonl` | Project-partitioned facet index (one line per session) |
+| `~/.claude/session-search/errors.log` | Error log for hook failures |
 | `~/.claude/projects/<project-id>/<session-id>.jsonl` | Raw session log files (read-only, owned by Claude Code) |
 | `/tmp/session-search-<uuid>.py` | Ephemeral extraction scripts (created and deleted per invocation) |
-| `/tmp/session-search-<uuid>.json` | Ephemeral extraction output (created and deleted per invocation) |
+| `/tmp/session-search-<uuid>.json` | Ephemeral extraction and facet output (created and deleted per invocation) |
 
 ## 3. Session Log Schema Reference
 
@@ -203,51 +203,114 @@ Extraction scripts should expect the following tool names in `tool_use` content 
 }
 ```
 
-### 4.3 Summarization Flow
+### 4.3 Facet Generation Flow
 
 1. The shell script receives the session ID via environment variable.
 2. The script locates the session JSONL file by scanning `~/.claude/projects/*/` for a matching filename.
 3. The script derives the project ID from the parent directory name.
-4. The script invokes `claude -p` with a summarization prompt, passing the session file path.
-5. `claude -p` reads the session log and generates a structured JSON summary.
-6. The script parses the JSON output and appends one line to `index.jsonl` and one line to `takeaways.jsonl`.
-7. Before appending, the script checks for duplicate session IDs by searching the index file. If the session ID already exists, the script skips the append.
+4. The script extracts the first entry's timestamp.
+5. The script checks for duplicate session IDs in the target facet partition file.
+6. The script launches a background worker via `nohup` with a 30-second timeout guard.
+7. The background worker invokes `claude -p --model haiku` with a facet extraction prompt, passing the session file path.
+8. `claude -p` reads the session log and generates a structured JSON facet with 11 fields.
+9. The background worker validates the JSON output and augments it with `projectId` and `timestamp`.
+10. The background worker appends a single JSONL line to `~/.claude/session-search/facets/<projectId>.jsonl`.
+11. On failure, the background worker appends a timestamped error to `~/.claude/session-search/errors.log` and exits silently.
 
-### 4.4 Summarization Prompt
+### 4.4 Facet Extraction Prompt
 
 The following text passes verbatim to `claude -p`:
 
 ```
-You summarize Claude Code session logs. Read the session log at the file path provided and produce a JSON object with exactly three fields:
+Analyze this Claude Code session and extract a structured facet. Read the session log at the file path provided.
 
-1. "sessionId": the session's UUID (extracted from the sessionId field in any entry)
-2. "summary": a single sentence describing the primary intent of the session (what the user set out to accomplish)
-3. "takeaways": a paragraph of three to five sentences covering: the user's intent, key tradeoffs encountered, struggle areas or blockers, the outcome, and any notable decisions
+RESPOND WITH ONLY A VALID JSON OBJECT matching this schema:
+{
+  "sessionId": "the session's UUID",
+  "underlying_goal": "What the user fundamentally wanted to achieve (one sentence)",
+  "goal_categories": {"category_name": count},
+  "outcome": "fully_achieved | mostly_achieved | partially_achieved | not_achieved | unclear_from_transcript",
+  "user_satisfaction_counts": {"level": count},
+  "claude_helpfulness": "unhelpful | slightly_helpful | moderately_helpful | very_helpful | essential",
+  "session_type": "single_task | multi_task | iterative_refinement | exploration | quick_question",
+  "friction_counts": {"friction_type": count},
+  "friction_detail": "One sentence describing friction, or empty string",
+  "primary_success": "none | fast_accurate_search | correct_code_edits | good_explanations | proactive_help | multi_file_changes | good_debugging",
+  "brief_summary": "One sentence: what the user wanted and whether they got it"
+}
 
-Output ONLY the JSON object. No markdown fencing, no extra text.
+CRITICAL GUIDELINES:
+1. goal_categories: Count ONLY what the USER explicitly asked for. Valid categories: debug_investigate, implement_feature, fix_bug, write_script_tool, refactor_code, configure_system, create_pr_commit, analyze_data, understand_codebase, write_tests, write_docs, deploy_infra, warmup_minimal
+2. user_satisfaction_counts: Base ONLY on explicit user signals. Valid levels: frustrated, dissatisfied, likely_satisfied, satisfied, happy, unsure
+3. friction_counts: Valid types: misunderstood_request, wrong_approach, buggy_code, user_rejected_action, claude_got_blocked, user_stopped_early, wrong_file_or_location, excessive_changes, slow_or_verbose, tool_failed, user_unclear, external_issue
+4. Output ONLY the JSON object. No markdown fencing, no extra text.
 ```
 
-### 4.5 Storage Schema
+### 4.5 Facet Partition Schema
 
-**`index.jsonl` line format:**
+Each line in `~/.claude/session-search/facets/<projectId>.jsonl`:
 
 ```json
-{"sessionId": "uuid", "projectId": "-Users-jane-myproject", "timestamp": "2026-03-29T14:30:00.000Z", "summary": "Fix failing authentication unit test caused by mocked token expiry."}
+{
+  "sessionId": "uuid",
+  "projectId": "-Users-jane-myproject",
+  "timestamp": "2026-03-29T14:30:00.000Z",
+  "underlying_goal": "Fix failing authentication unit test caused by mocked token expiry",
+  "goal_categories": {"fix_bug": 1},
+  "outcome": "fully_achieved",
+  "user_satisfaction_counts": {"satisfied": 1},
+  "claude_helpfulness": "very_helpful",
+  "session_type": "single_task",
+  "friction_counts": {},
+  "friction_detail": "",
+  "primary_success": "good_debugging",
+  "brief_summary": "User fixed a flaky authentication test by switching from hardcoded timestamps to relative time deltas; Claude identified the root cause within two iterations."
+}
 ```
 
-**`takeaways.jsonl` line format:**
+The plugin uses camelCase field names (aligned with Claude Code session log conventions). Facets imported from `/insights` undergo field name normalization: `session_id` becomes `sessionId`.
 
-```json
-{"sessionId": "uuid", "takeaways": "The user needed to fix a flaky authentication test that intermittently failed due to hardcoded token expiry timestamps. The initial approach of mocking the clock proved fragile, so the session pivoted to using relative time deltas. Claude identified the root cause within two iterations after reading the test fixtures. The fix required updating three test files and the shared auth helper module."}
+### 4.6 Unsummarized Session Guidance
+
+When the search command encounters sessions lacking facets, the orchestrator:
+
+1. Counts the unsummarized sessions.
+2. Prints: "Found N sessions without facets. The SessionEnd hook generates facets automatically for new sessions. Run `/insights` to backfill older sessions."
+3. Continues the search using only sessions that have facets.
+
+### 4.7 Error Observability
+
+The background worker logs failures to `~/.claude/session-search/errors.log`. Each line follows the format:
+
+```
+2026-04-05T14:30:00Z SESSION_ID=<id> ERROR: <message>
 ```
 
-### 4.6 Retroactive Summarization
+Common error categories:
+- `jq is required but not installed`: the `jq` dependency is missing
+- `No session file found`: the session JSONL file does not exist at the expected path
+- `claude -p failed`: the API call returned a non-zero exit code or timed out
+- `Malformed JSON response`: the API returned output that does not parse as valid JSON
 
-When the search command encounters session IDs lacking summaries, the orchestrator:
+The search command does not read `errors.log` during normal operation. The log serves as a diagnostic tool for users investigating missing facets.
 
-1. Prints: "Found N sessions without summaries."
-2. Prints: "Run `summarize-session --backfill` to generate missing summaries."
-3. Continues the search using only sessions that already have summaries in the index.
+### 4.8 Cold-Start Detection and Import
+
+The search command detects a cold-start condition when `~/.claude/session-search/facets/` does not exist or contains no `.jsonl` files. Three recovery paths handle the cold start:
+
+**Path A: Import from `/insights` facets.** The command checks `~/.claude/usage-data/facets/` for existing facet files generated by Anthropic's `/insights` command. If facets exist, the command runs an inline Python import script that:
+
+1. Reads each facet file from `~/.claude/usage-data/facets/<session-id>.json`.
+2. Reads the matching session metadata from `~/.claude/usage-data/session-meta/<session-id>.json` to obtain `project_path` and `start_time`.
+3. Derives `projectId` from `project_path` by replacing `/` with `-`.
+4. Renames `session_id` to `sessionId` (normalizing from Anthropic's snake_case to the plugin's camelCase convention).
+5. Adds `projectId` and `timestamp` fields to the facet.
+6. Appends the augmented facet to `~/.claude/session-search/facets/<projectId>.jsonl`.
+7. Skips facets that lack a matching session-meta file.
+
+**Path B: Inline generation for small session counts.** If no `/insights` facets exist and five or fewer sessions reside in `~/.claude/projects/`, the command generates facets inline by calling `claude -p --model haiku` with the facet extraction prompt for each session. This caps query-time latency at approximately 25-75 seconds.
+
+**Path C: Guidance for large session counts.** If more than five unsummarized sessions exist without `/insights` facets, the command prints guidance to run `/insights` and stops. The `/insights` command processes up to 50 sessions per run and generates facets at `~/.claude/usage-data/facets/`, which the import flow consumes on the next invocation.
 
 ## 5. Component 2: Session Search
 
@@ -261,22 +324,26 @@ When the search command encounters session IDs lacking summaries, the orchestrat
 
 ```
 User query ($ARGUMENTS)
-  │
-  ▼
+  |
+  v
+Pre-Step: Cold Start Detection
+  Check facets directory. Import or generate if needed.
+  |
+  v
 Step 1: Session Mapping
-  Read index.jsonl. Match query against summaries
-  (or select all). Produce session ID list.
-  │
-  ▼
+  Read facet partition files. Match query against facet
+  fields. Determine facet sufficiency.
+  |
+  v
 Step 2: Data Extraction
-  Spawn subagent with session log schema + task context.
-  Subagent writes a Python script, executes it,
-  persists results to /tmp/session-search-<uuid>.json.
-  │
-  ▼
+  If facet-sufficient: skip (use facets directly).
+  If facet-insufficient: spawn extraction subagent
+  with raw session logs and facet context.
+  |
+  v
 Step 3: Analysis
   Spawn analysis subagent with custom system prompt.
-  Subagent reads extracted data, produces final output.
+  Read facet or extracted data, produce final output.
   Print to terminal.
 ```
 
@@ -286,30 +353,38 @@ Step 3: Analysis
 
 The orchestrator classifies the query into two categories:
 
-- **All sessions:** queries containing keywords like "all," "every," "entire history," "everything," or queries that inherently require comprehensive coverage (ROI analysis, pattern detection, skill extraction)
+- **All sessions:** queries containing keywords like "all," "every," "entire history," "everything," or queries that inherently require comprehensive coverage (ROI analysis, pattern detection, skill extraction, friction analysis, satisfaction trends)
 - **Subset:** time-bounded queries ("today," "this week," "last month"), project-specific queries, or topic-specific queries
 
 ### 6.2 All-Sessions Path
 
-1. Read `~/.claude/session-search/index.jsonl`.
-2. Collect every session ID and its corresponding project directory.
-3. Resolve each session ID to its JSONL file path: `~/.claude/projects/<projectId>/<sessionId>.jsonl`.
+1. Read all `.jsonl` files from `~/.claude/session-search/facets/`.
+2. Collect every facet into a unified list.
 
 ### 6.3 Subset Path
 
-1. Read `~/.claude/session-search/index.jsonl`.
+1. Read all `.jsonl` files from `~/.claude/session-search/facets/`.
 2. Apply time-based filters by parsing the `timestamp` field against date constraints in the query.
 3. Apply project-based filters by matching the `projectId` field.
-4. For semantic filtering, compare the query against each line's `summary` field.
-5. Select sessions whose summaries indicate relevance to the query.
+4. For semantic filtering, compare the query against each facet's `brief_summary`, `underlying_goal`, `goal_categories`, and `session_type` fields.
+5. Select facets whose content indicates relevance to the query.
 
-### 6.4 Missing Summaries
+### 6.4 Facet Sufficiency
 
-After collecting session IDs, the orchestrator cross-references against known session files in `~/.claude/projects/*/`:
+After selecting facets, the orchestrator determines whether the query can be answered from facet fields alone:
 
-1. Use `Glob` to find all `*.jsonl` files matching session UUID patterns.
-2. Compare against session IDs present in `index.jsonl`.
-3. If unsummarized sessions exist, print a warning with the count of unsummarized sessions and a copy-pasteable backfill command (per Section 4.6).
+- **Facet-sufficient queries:** outcome distributions, helpfulness ratings, session type breakdowns, friction analysis, goal category distributions, satisfaction trends, brief summary listings, underlying goal analysis. These queries resolve from the structured facet fields without parsing raw session logs.
+- **Facet-insufficient queries:** queries requiring tool call details, specific file paths, git operations, code changes, token usage, session duration, user prompt text beyond the brief summary, or tool call sequences. These queries require raw session log extraction.
+
+If the query is facet-insufficient, the orchestrator resolves each matched `sessionId` to its raw session log path: `~/.claude/projects/<projectId>/<sessionId>.jsonl`.
+
+### 6.5 Missing Facets
+
+After collecting facets, the orchestrator cross-references against known session files in `~/.claude/projects/*/`:
+
+1. Use `Glob` to find all non-agent `*.jsonl` files matching session UUID patterns.
+2. Compare against session IDs present in the facet partition files.
+3. If unsummarized sessions exist, print a warning with the count and guidance to run `/insights` for backfill (per Section 4.6).
 
 ## 7. Step 2: Data Extraction
 
@@ -327,6 +402,9 @@ You write and execute Python 3 scripts that extract data from Claude Code sessio
 ## Session Log Schema
 [The orchestrator pastes the full schema reference from Section 3]
 
+## Pre-Extracted Facet Data
+Structured facet data has already been extracted for each session and is available at /tmp/session-search-facets-<uuid>.json. Each facet contains: sessionId, projectId, timestamp, underlying_goal, goal_categories, outcome, user_satisfaction_counts, claude_helpfulness, session_type, friction_counts, friction_detail, primary_success, brief_summary. Use these fields instead of re-deriving them from raw logs. Merge facet data with any additional fields extracted from the raw session files.
+
 ## Task
 [Dynamically generated description of what data to extract, tailored to the user's query]
 
@@ -337,14 +415,15 @@ You write and execute Python 3 scripts that extract data from Claude Code sessio
 1. Write a Python 3 script to /tmp/session-search-<uuid>.py
 2. Use only standard library modules (json, os, sys, re, datetime, collections, pathlib)
 3. The script reads the listed JSONL files line by line using json.loads()
-4. Skip malformed lines with a try/except around json.loads()
-5. Extract the data described in the Task section
-6. Write output as JSON to /tmp/session-search-<uuid>.json
-7. Execute the script: python3 /tmp/session-search-<uuid>.py
-8. Verify the output file contains valid JSON
-9. If the script fails to execute or produces invalid JSON, read the stderr output, diagnose the error, fix the script, and re-execute. Allow up to 2 retries before reporting failure.
-10. The output JSON must stay under 50,000 characters. Aggregate data within the script: compute counts, top-N lists, averages, and statistical summaries rather than emitting raw per-entry arrays. The analysis subagent receives this output in its context window, so token efficiency is a hard constraint.
-11. Report the output file path
+4. Read and merge pre-extracted facet data from /tmp/session-search-facets-<uuid>.json
+5. Skip malformed lines with a try/except around json.loads()
+6. Extract the data described in the Task section
+7. Write output as JSON to /tmp/session-search-<uuid>.json
+8. Execute the script: python3 /tmp/session-search-<uuid>.py
+9. Verify the output file contains valid JSON
+10. If the script fails to execute or produces invalid JSON, read the stderr output, diagnose the error, fix the script, and re-execute. Allow up to 2 retries before reporting failure.
+11. The output JSON must stay under 50,000 characters. Aggregate data within the script: compute counts, top-N lists, averages, and statistical summaries rather than emitting raw per-entry arrays. The analysis subagent receives this output in its context window, so token efficiency is a hard constraint.
+12. Report the output file path
 ```
 
 ### 7.3 Rationale for Code Generation
@@ -365,6 +444,10 @@ A generated script adapts to each query without maintaining a library of hardcod
 - **Output:** writes a single JSON file to `/tmp/`
 - **Error handling:** skip malformed lines, log skipped count to stderr
 - **Lifecycle:** the orchestrator deletes both the script and output file after Step 3 completes
+
+### 7.5 Facet-Sufficient Fast Path
+
+When the orchestrator determines the query is facet-sufficient (per Section 6.4), Step 2 is skipped entirely. The facet data written to `/tmp/session-search-facets-<uuid>.json` during Step 1 serves as the direct input to Step 3. No extraction subagent runs and no Python script executes.
 
 ## 8. Step 3: Analysis
 
@@ -402,7 +485,7 @@ Each example walks through the complete three-step flow with concrete artifacts:
 
 #### Step 1: Session Mapping
 
-The orchestrator classifies the query as "all sessions" because ROI calculation demands comprehensive coverage across every recorded interaction. The orchestrator reads `~/.claude/session-search/index.jsonl`, parses each line, and collects all session IDs regardless of project or date. The index yields 47 sessions spanning 8 distinct projects.
+The orchestrator classifies the query as "all sessions" because ROI calculation demands comprehensive coverage across every recorded interaction. The orchestrator reads all `.jsonl` files from `~/.claude/session-search/facets/`, parses each line, and collects all facets regardless of project or date. The facet partitions yield 47 sessions spanning 8 distinct projects. The orchestrator determines this query is facet-insufficient because ROI analysis requires token counts and session durations from raw session logs.
 
 The orchestrator builds a JSON manifest of session file paths:
 
@@ -592,7 +675,7 @@ with incorrect column constraints.
 
 #### Step 1: Session Mapping
 
-The orchestrator classifies the query as "subset" because the word "today" constrains the time window to the current date. The orchestrator reads `~/.claude/session-search/index.jsonl` and filters entries whose `timestamp` falls on 2026-03-29. Four sessions match, all belonging to project `-Users-jane-api-server`.
+The orchestrator classifies the query as "subset" because the word "today" constrains the time window to the current date. The orchestrator reads all `.jsonl` files from `~/.claude/session-search/facets/` and filters facets whose `timestamp` falls on 2026-03-29. Four sessions match, all belonging to project `-Users-jane-api-server`. The orchestrator determines this query is facet-insufficient because standup summaries require specific user prompts and tool usage details from raw session logs.
 
 #### Step 2: Data Extraction
 
@@ -742,7 +825,7 @@ Bug Fixes
 
 #### Step 1: Session Mapping
 
-The orchestrator classifies the query as "all sessions" because pattern detection across behaviors requires the broadest possible sample. The orchestrator reads `~/.claude/session-search/index.jsonl` and collects every session ID. The index contains 47 sessions across 8 projects.
+The orchestrator classifies the query as "all sessions" because pattern detection across behaviors requires the broadest possible sample. The orchestrator reads all `.jsonl` files from `~/.claude/session-search/facets/` and collects every facet. The facet partitions contain 47 sessions across 8 projects. The orchestrator determines this query is facet-insufficient because skill extraction requires tool sequences and normalized prompt text from raw session logs.
 
 #### Step 2: Data Extraction
 
@@ -1055,7 +1138,7 @@ allowed-tools: [Bash, Read, Write, Agent, Glob, Grep]
 
 ### Command Body
 
-The following markdown forms the body of `commands/session-search.md`, placed after the frontmatter:
+The following markdown forms the body of `commands/session-search.md`, placed after the frontmatter. The canonical version of this command resides in the implementation file; this section captures the design for reference.
 
 ````markdown
 # Session Search
@@ -1064,7 +1147,7 @@ The user invoked this command with query: $ARGUMENTS
 
 ## Orchestration
 
-Execute these three steps in sequence.
+Execute these steps in sequence.
 
 Before starting, generate a unique run identifier:
 ```bash
@@ -1072,158 +1155,66 @@ RUN_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex[:8])")
 ```
 Use this identifier in all temporary file paths below.
 
+### Pre-Step: Cold Start Detection
+
+1. Check if `~/.claude/session-search/facets/` exists and contains at least one `.jsonl` file.
+2. If the directory does not exist or contains no `.jsonl` files:
+   a. Check if `~/.claude/usage-data/facets/` contains `.json` files (facets generated by `/insights`).
+   b. If facets from `/insights` exist: run an inline Python import script that reads each facet, derives `projectId` and `timestamp` from `~/.claude/usage-data/session-meta/`, and appends to `~/.claude/session-search/facets/<projectId>.jsonl`. Continue to Step 1.
+   c. If no facets from `/insights` exist: count sessions in `~/.claude/projects/*/`. If 5 or fewer: generate facets inline. If more than 5: print guidance to run `/insights`. Stop.
+3. If facet files exist, proceed to Step 1.
+
 ### Step 1: Session Mapping
 
-1. Read `~/.claude/session-search/index.jsonl`. If the file does not exist or contains zero lines, inform the user that no sessions have been summarized yet and suggest running retroactive summarization. Stop.
-2. Parse each line as JSON. Each line contains: `sessionId`, `projectId`, `timestamp`, and `summary`.
+1. Read all `.jsonl` files from `~/.claude/session-search/facets/`. Each line contains: `sessionId`, `projectId`, `timestamp`, `underlying_goal`, `goal_categories`, `outcome`, `user_satisfaction_counts`, `claude_helpfulness`, `session_type`, `friction_counts`, `friction_detail`, `primary_success`, `brief_summary`.
+2. Parse all lines into a unified list of facets.
 3. Classify the query:
-   - **All sessions**: queries about aggregate statistics, broad patterns, ROI, or skill extraction select every session.
-   - **Subset**: queries about a specific time range ("today", "this week"), project, or topic select only sessions whose `summary` or `timestamp` fields match the query intent.
-4. Produce a list of matching session IDs and resolve each to its file path: `~/.claude/projects/<projectId>/<sessionId>.jsonl`.
-5. If the query requires richer context for session selection, read the corresponding entries from `~/.claude/session-search/takeaways.jsonl` (keyed by `sessionId`) to access the 3-5 sentence takeaways for each session.
-6. If zero sessions match, inform the user and suggest broadening the query. Stop.
-7. If any session files exist in `~/.claude/projects/` that lack entries in `index.jsonl`, print: "Found N sessions without summaries. Run `summarize-session --backfill` to generate missing summaries." Continue with the sessions that already have summaries.
-8. Write the matched file paths as a JSON array to `/tmp/session-search-manifest-${RUN_ID}.json`.
+   - **All sessions**: queries about aggregate statistics, broad patterns, ROI, friction analysis, satisfaction trends, or skill extraction select every session.
+   - **Subset**: queries about a specific time range, project, or topic select only sessions whose facet fields match the query intent.
+4. If zero sessions match, inform the user and suggest broadening the query. Stop.
+5. Determine facet sufficiency: can the query be answered from facet fields alone?
+6. Write matched facets to `/tmp/session-search-facets-${RUN_ID}.json`.
+7. If facet-insufficient, resolve session file paths and write manifest to `/tmp/session-search-manifest-${RUN_ID}.json`.
+8. Check for unsummarized sessions and print guidance if any exist.
 
 ### Step 2: Data Extraction
 
-1. Verify Python 3 availability by running `python3 --version`. If the command fails, print installation instructions and stop.
-2. Determine what data the analysis step needs based on the user's query. Write a clear task description specifying exactly which fields to extract from the session logs.
-3. Spawn a subagent using the Agent tool with model `haiku` and the following prompt structure:
-
-   > You write and execute Python 3 scripts that extract data from Claude Code session logs.
-   >
-   > ## Session Log Schema
-   > Session logs reside at `~/.claude/projects/<project-id>/<session-id>.jsonl`. Each line contains a JSON object. Key entry types:
-   > - `user` entries: `message.content` holds either a string (direct user input) or an array of content blocks (tool results with `type: "tool_result"`)
-   > - `assistant` entries: `message.content` holds an array with `{type: "thinking"}`, `{type: "text"}`, and `{type: "tool_use", name: "...", input: {...}}` blocks. `message.model` identifies the model. `message.usage` contains token counts.
-   > - Universal fields: `uuid`, `timestamp` (ISO 8601), `sessionId`, `cwd`, `gitBranch`
-   >
-   > ## Task
-   > [Insert the task description from above]
-   >
-   > ## Session Files
-   > Read the manifest at `/tmp/session-search-manifest-${RUN_ID}.json` for the list of session file paths.
-   >
-   > ## Requirements
-   > 1. Write a Python 3 script to `/tmp/session-search-extract-${RUN_ID}.py`
-   > 2. Use only standard library modules (json, os, sys, re, datetime, collections, pathlib)
-   > 3. Read JSONL files line by line. Skip malformed lines with try/except around json.loads()
-   > 4. Write output as JSON to `/tmp/session-search-output-${RUN_ID}.json`
-   > 5. Execute: `python3 /tmp/session-search-extract-${RUN_ID}.py`
-   > 6. Verify the output file contains valid JSON
-   > 7. If the script fails to execute or produces invalid JSON, read the stderr output, diagnose the error, fix the script, and re-execute. Allow up to 2 retries before reporting failure.
-   > 8. The output JSON must stay under 50,000 characters. Aggregate data within the script: compute counts, top-N lists, averages, and statistical summaries rather than emitting raw per-entry arrays. The analysis subagent receives this output in its context window, so token efficiency is a hard constraint.
-
-4. Wait for the subagent to complete.
+1. If facet-sufficient: skip this step entirely. Proceed to Step 3.
+2. If facet-insufficient:
+   a. Verify Python 3 availability.
+   b. Spawn extraction subagent (model: haiku) with session log schema, pre-extracted facet data context, task description, and session manifest.
+   c. Subagent writes and executes a Python script that merges facet data with raw session log extraction.
+   d. Wait for subagent to complete.
 
 ### Step 3: Analysis
 
-1. Build a system prompt tailored to the user's query. The prompt must include:
-   - The user's original query (verbatim)
-   - Analysis methodology specific to the query type
-   - Output format expectations
-   - Writing style constraints: no contractions, active voice, present tense, no em dashes
-2. Spawn an analysis subagent using the Agent tool with the custom system prompt:
-
-   > Read the extracted session data from `/tmp/session-search-output-${RUN_ID}.json` and answer the following query:
-   >
-   > **User query**: $ARGUMENTS
-   >
-   > [Insert tailored analysis instructions]
-   >
-   > Print the complete analysis directly to the terminal using markdown formatting.
-
-3. Wait for the subagent to complete.
+1. Build a system prompt noting whether the data source is facet-only or facet-plus-extraction.
+2. Spawn analysis subagent with custom system prompt.
+3. Wait for subagent to complete.
 
 ### Cleanup
 
 Remove temporary files:
 ```
-rm -f /tmp/session-search-manifest-${RUN_ID}.json /tmp/session-search-extract-${RUN_ID}.py /tmp/session-search-output-${RUN_ID}.json
+rm -f /tmp/session-search-manifest-${RUN_ID}.json /tmp/session-search-extract-${RUN_ID}.py /tmp/session-search-output-${RUN_ID}.json /tmp/session-search-facets-${RUN_ID}.json /tmp/session-search-import-${RUN_ID}.py
 ```
 ````
 
-## 12. Summarization Script: `scripts/summarize-session.sh`
+## 12. Facet Generation Script: `scripts/summarize-session.sh`
 
-The summarization script runs as the hook handler invoked on `SessionEnd`. The hook passes session metadata through environment variables. The script expects `SESSION_ID` to contain the session identifier. The script verifies `jq` availability at startup and exits with a diagnostic message if the binary is not found.
+The facet generation script runs as the hook handler invoked on `SessionEnd`. The hook passes session metadata through environment variables. The script expects `SESSION_ID` to contain the session identifier. The script verifies `jq` availability at startup and logs a diagnostic error if the binary is not found.
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
+The script performs quick synchronous checks (session file lookup, duplicate detection, timestamp extraction), then launches a background worker via `nohup` with a 30-second timeout guard. The background worker calls `claude -p --model haiku` to generate a structured facet, validates the JSON response, augments it with `projectId` and `timestamp`, and appends the result to the appropriate project partition file at `~/.claude/session-search/facets/<projectId>.jsonl`. The main process exits immediately with code 0 regardless of background worker outcome.
 
-# scripts/summarize-session.sh
-# Summarizes a completed Claude Code session and appends to the summary store.
+All errors append to `~/.claude/session-search/errors.log` with a timestamp and session ID. The script never produces non-zero exit codes to avoid surfacing hook error messages in Claude Code.
 
-SESSION_ID="${SESSION_ID:?SESSION_ID environment variable must be set}"
-STORE_DIR="$HOME/.claude/session-search"
-INDEX_FILE="$STORE_DIR/index.jsonl"
-TAKEAWAYS_FILE="$STORE_DIR/takeaways.jsonl"
-
-# Locate the session JSONL file across all projects
-SESSION_FILE=$(find "$HOME/.claude/projects" -name "${SESSION_ID}.jsonl" 2>/dev/null | head -n 1)
-if [ -z "$SESSION_FILE" ]; then
-  echo "ERROR: No session file found for ${SESSION_ID}" >&2
-  exit 1
-fi
-
-# Derive the project ID from the parent directory name
-PROJECT_ID=$(basename "$(dirname "$SESSION_FILE")")
-
-# Ensure the summary store directory exists
-mkdir -p "$STORE_DIR"
-
-# Skip if this session already has a summary
-if [ -f "$INDEX_FILE" ] && grep -q "\"sessionId\":\"${SESSION_ID}\"" "$INDEX_FILE"; then
-  exit 0
-fi
-
-# Extract the timestamp of the first entry
-FIRST_TIMESTAMP=$(head -n 1 "$SESSION_FILE" | jq -r '.timestamp // empty' 2>/dev/null || echo "")
-
-# Invoke claude -p with the summarization prompt
-SUMMARY_JSON=$(claude -p --model haiku \
-  "You summarize Claude Code session logs. Read the session log at the following path and produce a JSON object with exactly three fields:
-
-1. \"sessionId\": the session UUID (use: ${SESSION_ID})
-2. \"summary\": a single sentence describing the primary intent of the session
-3. \"takeaways\": a paragraph of three to five sentences covering the user intent, key tradeoffs, struggle areas, the outcome, and notable decisions
-
-Output ONLY the JSON object. No markdown fencing, no extra text.
-
-Session file path: ${SESSION_FILE}" 2>/dev/null) || {
-  echo "ERROR: claude -p failed for session ${SESSION_ID}" >&2
-  exit 1
-}
-
-# Validate that the output parses as JSON
-if ! echo "$SUMMARY_JSON" | jq -e . >/dev/null 2>&1; then
-  echo "ERROR: claude -p returned malformed JSON for session ${SESSION_ID}" >&2
-  exit 1
-fi
-
-# Construct the index entry
-INDEX_LINE=$(echo "$SUMMARY_JSON" | jq -c \
-  --arg pid "$PROJECT_ID" \
-  --arg ts "$FIRST_TIMESTAMP" \
-  '{sessionId: .sessionId, projectId: $pid, timestamp: $ts, summary: .summary}')
-
-# Construct the takeaways entry
-TAKEAWAYS_LINE=$(echo "$SUMMARY_JSON" | jq -c \
-  '{sessionId: .sessionId, takeaways: .takeaways}')
-
-# Append to both files
-echo "$INDEX_LINE" >> "$INDEX_FILE"
-echo "$TAKEAWAYS_LINE" >> "$TAKEAWAYS_FILE"
-```
-
-The script follows a linear flow: locate, check, summarize, parse, append. Each failure mode produces a descriptive message on stderr and exits with a non-zero status, leaving the index files unmodified. The `set -euo pipefail` directive ensures any unexpected failure halts execution immediately rather than silently corrupting data.
+The canonical implementation resides in `scripts/summarize-session.sh`. Refer to that file for the current source code.
 
 ## 13. Error Handling and Edge Cases
 
-### 13.1 Empty Index
+### 13.1 Empty Facet Store
 
-The orchestrator detects an empty or missing `index.jsonl` during Step 1 and informs the user that no sessions have been summarized. The response suggests running retroactive summarization against existing session files.
+The orchestrator detects an empty or missing facet directory during the Pre-Step and triggers cold-start detection (per Section 4.8). If no recovery path produces facets, the orchestrator informs the user that no sessions have been indexed and suggests running `/insights` to generate facets.
 
 ### 13.2 Missing Session Files
 
@@ -1235,7 +1226,7 @@ The extraction script wraps each `json.loads()` call in a try/except block. Line
 
 ### 13.4 `claude -p` Failure
 
-The summarization script checks the exit code of `claude -p`. A non-zero exit code triggers an error message to stderr that includes the session ID, and the script exits without writing to any index file. Subsequent hook invocations for other sessions proceed independently.
+The background worker checks the exit code of `claude -p`. A non-zero exit code or timeout triggers an error entry in `~/.claude/session-search/errors.log` that includes the session ID. The worker exits without writing to any facet partition file. The main hook process has already exited with code 0, so the failure does not surface in Claude Code. Subsequent hook invocations for other sessions proceed independently.
 
 ### 13.5 Python Not Available
 
@@ -1260,6 +1251,20 @@ The summarization script calls `mkdir -p ~/.claude/session-search/` before any f
 ### 13.10 Extraction Script Failure
 
 If the extraction script fails to execute or produces invalid output, the extraction subagent reads the stderr, corrects the script, and re-executes. The subagent allows up to two retries. After three total attempts, the subagent reports failure and the orchestrator informs the user that extraction could not complete for the given query.
+
+### 13.11 Hook Error Logging
+
+The background worker logs all failures to `~/.claude/session-search/errors.log`. The main hook process always exits with code 0 regardless of background worker outcome. This prevents hook failures from surfacing as Claude Code error messages.
+
+### 13.12 Cold-Start Edge Cases
+
+- **No session-meta for a facet:** The import skips facets lacking a matching session-meta file and logs a warning. Some `/insights` facets may reference sessions whose metadata was cleaned up.
+- **Partial import:** If the import fails midway, the next invocation re-imports without duplicates because the import checks for existing session IDs before appending.
+- **Empty session directory:** If `~/.claude/projects/` contains no session files, the command reports zero sessions and stops.
+
+### 13.13 Facet-Session File Mismatch
+
+A facet may reference a session whose raw JSONL file no longer exists (the user deleted it or moved machines). When resolving session file paths for facet-insufficient queries, the orchestrator verifies file existence and excludes missing files from the manifest. The analysis proceeds with available data.
 
 ## 14. Out of Scope for v0
 
